@@ -112,6 +112,23 @@ def _is_allowed_upload_filename(filename: str) -> bool:
     return Path(filename).suffix.lower() in _ALLOWED_UPLOAD_EXTENSIONS
 
 
+def _reverse_samples_allowed() -> bool:
+    """With the REA plugin installed and verified, chat uploads also take samples.
+
+    Reverse-engineering targets (executables, libraries, packages, firmware,
+    often without an extension) are attached to the conversation like
+    documents; Flocks only stores them in the session's upload directory.
+    """
+
+    try:
+        from flocks.rea import runtime
+
+        return runtime.is_ready()
+    except Exception as exc:
+        log.debug("workspace.chat_upload.rea_check_failed", {"error": str(exc)})
+        return False
+
+
 def _node_from_path(path: Path, root: Path) -> WorkspaceNode:
     """Build a WorkspaceNode from a filesystem path.
 
@@ -383,7 +400,7 @@ async def upload_files(
             if not filename:
                 results.append({"name": "", "error": "Filename is invalid"})
                 continue
-            if not _is_allowed_upload_filename(filename):
+            if not _is_allowed_upload_filename(filename) and not _reverse_samples_allowed():
                 results.append({
                     "name": filename,
                     "error": f"Unsupported file type (allowed: {_ALLOWED_UPLOAD_LABEL})",
@@ -650,6 +667,13 @@ async def move_item(body: MoveRequest):
         raise HTTPException(status_code=404, detail=f"Source not found: {body.src}")
     if dst.exists():
         raise HTTPException(status_code=409, detail=f"Destination already exists: {body.dst}")
+    # Reject before mkdir below, which would otherwise leave new folders
+    # inside the source tree when shutil.move then refuses the move.
+    if src.is_dir() and dst.is_relative_to(src):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot move a directory into itself: {body.src} -> {body.dst}",
+        )
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst))
     log.info("workspace.item.moved", {"src": body.src, "dst": body.dst})

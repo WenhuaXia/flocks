@@ -21,6 +21,7 @@ from flocks.provider.provider import (
     StreamChunk,
 )
 from flocks.provider.interleaved import is_kimi_k27_code_model, is_kimi_k3_model
+from flocks.provider.token_usage import normalize_usage
 from flocks.utils.log import Log
 
 log = Log.create(service="provider.openai_base")
@@ -428,65 +429,12 @@ def resolve_verify_ssl(custom_settings: Any, default: bool = True) -> bool:
     return default
 
 
-def _normalize_stream_usage(raw_usage: Any) -> Optional[Dict[str, int]]:
-    """Normalize provider usage objects to a shared stream usage schema."""
-    if not raw_usage:
-        return None
+def _normalize_stream_usage(raw_usage: Any, *, response_id: Any = None) -> Optional[Dict[str, Any]]:
+    """Normalize provider usage objects to the shared usage schema.
 
-    _pt = getattr(raw_usage, "prompt_tokens", None)
-    prompt_tokens = (_pt if _pt is not None else getattr(raw_usage, "input_tokens", 0)) or 0
-    _ct = getattr(raw_usage, "completion_tokens", None)
-    completion_tokens = (_ct if _ct is not None else getattr(raw_usage, "output_tokens", 0)) or 0
-    completion_details = getattr(raw_usage, "completion_tokens_details", None)
-    output_details = getattr(raw_usage, "output_tokens_details", None)
-    nested_reasoning_tokens = (
-        getattr(completion_details, "reasoning_tokens", 0)
-        or getattr(output_details, "reasoning_tokens", 0)
-        or 0
-    )
-    reasoning_tokens = (
-        getattr(raw_usage, "reasoning_tokens", 0)
-        or nested_reasoning_tokens
-        or 0
-    )
-    if nested_reasoning_tokens:
-        # OpenAI reports reasoning_tokens as a breakdown already included in
-        # completion_tokens / output_tokens. Flocks stores visible output and
-        # reasoning separately, so remove that nested subset before persisting.
-        completion_tokens = max(
-            0,
-            completion_tokens - nested_reasoning_tokens,
-        )
-    total_tokens = getattr(raw_usage, "total_tokens", 0) or (
-        prompt_tokens + completion_tokens + reasoning_tokens
-    )
-    cache_read_tokens = getattr(raw_usage, "cache_read_input_tokens", 0) or 0
-    cache_write_tokens = getattr(raw_usage, "cache_creation_input_tokens", 0) or 0
-
-    if not any(
-        [
-            prompt_tokens,
-            completion_tokens,
-            reasoning_tokens,
-            total_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-        ]
-    ):
-        return None
-
-    usage = {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-    }
-    if reasoning_tokens:
-        usage["reasoning_tokens"] = reasoning_tokens
-    if cache_read_tokens:
-        usage["cache_read_input_tokens"] = cache_read_tokens
-    if cache_write_tokens:
-        usage["cache_creation_input_tokens"] = cache_write_tokens
-    return usage
+    See ``flocks.provider.token_usage`` for the formats read and the keys set.
+    """
+    return normalize_usage(raw_usage, response_id=response_id)
 
 
 def _supports_include_usage_fallback(exc: Exception) -> bool:
@@ -1172,13 +1120,7 @@ class OpenAIBaseProvider(BaseProvider):
             model=response.model,
             content=msg.content or "",
             finish_reason=choice.finish_reason or "stop",
-            usage={
-                "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-                "completion_tokens": (
-                    response.usage.completion_tokens if response.usage else 0
-                ),
-                "total_tokens": response.usage.total_tokens if response.usage else 0,
-            },
+            usage=normalize_usage(response.usage, response_id=response.id) or {},
         )
 
     async def chat_stream(
@@ -1256,7 +1198,10 @@ class OpenAIBaseProvider(BaseProvider):
         _first_delta_logged = False
 
         async for chunk in stream:
-            normalized_usage = _normalize_stream_usage(getattr(chunk, "usage", None))
+            normalized_usage = _normalize_stream_usage(
+                getattr(chunk, "usage", None),
+                response_id=getattr(chunk, "id", None),
+            )
             if normalized_usage:
                 stream_usage = normalized_usage
             if not chunk.choices:

@@ -493,6 +493,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("workflow.trigger_runtime.start_failed", {"error": str(e)})
 
+    # Configure the direct knowledge client without contacting the engine.
+    # An unreachable engine must not delay Core startup.
+    try:
+        from flocks.knowledgebase.runtime import start_from_config
+
+        knowledgebase_status = await start_from_config()
+        log.info("knowledgebase.integration.start", {"status": knowledgebase_status.get("status", "disabled")})
+    except Exception as exc:
+        log.warning("knowledgebase.integration.start_failed", {"error_type": type(exc).__name__})
+
+    # Extension services (e.g. Pro's scheduled audits) start on this loop once
+    # the server is ready, without holding up requests.
+    from flocks.extensions import run_startup_hooks
+
+    _schedule_startup_phase(app, log, "extensions.startup_hooks", run_startup_hooks)
+
     blocking_startup_ms = int((time.perf_counter() - startup_started_at) * 1000)
     log.info("server.startup.ready", {
         "blocking_duration_ms": blocking_startup_ms,
@@ -501,12 +517,28 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    try:
+        from flocks.knowledgebase.runtime import stop as stop_knowledgebase
+
+        await stop_knowledgebase()
+    except Exception as exc:
+        log.warning("knowledgebase.integration.stop_failed", {"error_type": type(exc).__name__})
+
     background_tasks = list(getattr(app.state, "startup_background_tasks", []))
     for task in background_tasks:
         if not task.done():
             task.cancel()
     if background_tasks:
         await asyncio.gather(*background_tasks, return_exceptions=True)
+
+    # Extension services (e.g. Pro webhook consumers) stop while sessions and
+    # storage are still available to them.
+    try:
+        from flocks.extensions import run_shutdown_hooks
+
+        await run_shutdown_hooks()
+    except Exception as exc:
+        log.warning("extensions.shutdown_hooks_failed", {"error": str(exc)})
 
     try:
         from flocks.console.scheduler import ConsoleSyncScheduler
@@ -1213,6 +1245,8 @@ from flocks.server.routes.workflow import router as workflow_router, webhook_rou
 # WebUI: Skill & Command routes
 from flocks.server.routes.skill import router as skill_router
 from flocks.server.routes.hub import router as hub_router
+# REA reverse-analysis component install and session work
+from flocks.server.routes.rea import router as rea_router
 # WebUI: Hook management routes
 from flocks.server.routes.hooks import router as hooks_router
 # Model management: Default model, Usage routes
@@ -1228,6 +1262,7 @@ from flocks.server.routes.background_task import router as background_task_route
 # Channel routes (webhook + status)
 from flocks.server.routes.channel import router as channel_router
 # Workspace routes (file manager)
+from flocks.server.routes.knowledgebase import create_router as create_knowledgebase_router
 from flocks.server.routes.workspace import router as workspace_router
 # Update (self-upgrade)
 from flocks.server.routes.update import router as update_router
@@ -1269,6 +1304,7 @@ app.include_router(workflow_webhook_router, tags=["WorkflowWebhook"])
 app.include_router(skill_router, prefix="/api", tags=["Skill"])
 # WebUI: Hub routes
 app.include_router(hub_router, prefix="/api", tags=["Hub"])
+app.include_router(rea_router, prefix="/api", tags=["REA"])
 # WebUI: Hook management routes
 app.include_router(hooks_router, prefix="/api/hooks", tags=["Hooks"])
 # Model management: Default model routes
@@ -1292,6 +1328,7 @@ app.include_router(channel_router, prefix="/api/channel", tags=["Channel"])
 app.include_router(channel_router, prefix="/channel", tags=["Channel"])
 # Workspace (file manager)
 app.include_router(workspace_router, prefix="/api/workspace", tags=["Workspace"])
+app.include_router(create_knowledgebase_router(), prefix="/api")
 # Self-upgrade routes
 app.include_router(update_router, prefix="/api/update", tags=["Update"])
 # Log viewing routes
