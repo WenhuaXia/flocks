@@ -368,6 +368,42 @@ class TestUpload:
         assert "Unsupported file type" in result["error"]
         assert not (_ws(workspace_client) / "archive.zip").exists()
 
+    @pytest.mark.parametrize("filename", ["sample.exe", "libfoo.so", "rea_demo", "app.apk"])
+    def test_chat_upload_takes_reverse_samples_only_once_rea_is_ready(
+        self, workspace_client, monkeypatch, filename: str,
+    ):
+        from flocks.rea import runtime
+        from flocks.session.files import resolve_staged_chat_upload
+
+        client = _client(workspace_client)
+        body = b"\x7fELF\x02\x01\x01\x00"
+        monkeypatch.setattr(runtime, "is_ready", lambda: False)
+        refused = client.post(
+            "/api/workspace/upload?purpose=chat", files=[("files", (filename, body, "application/octet-stream"))],
+        ).json()["uploaded"][0]
+        assert "Unsupported file type" in refused["error"]
+
+        monkeypatch.setattr(runtime, "is_ready", lambda: True)
+        accepted = client.post(
+            "/api/workspace/upload?purpose=chat", files=[("files", (filename, body, "application/octet-stream"))],
+        ).json()["uploaded"][0]
+        assert accepted.get("error") is None
+        assert accepted["name"] == filename
+        assert accepted["is_text_file"] is False
+        assert resolve_staged_chat_upload("usr_workspace", accepted["uploadID"]).read_bytes() == body
+
+    def test_chat_upload_size_limit_still_applies_to_samples(self, workspace_client, monkeypatch):
+        from flocks.rea import runtime
+
+        monkeypatch.setattr(runtime, "is_ready", lambda: True)
+        monkeypatch.setenv("FLOCKS_WORKSPACE_MAX_UPLOAD_MB", "1")
+        client = _client(workspace_client)
+        result = client.post(
+            "/api/workspace/upload?purpose=chat",
+            files=[("files", ("big.bin", b"\0" * (1024 * 1024 + 1), "application/octet-stream"))],
+        ).json()["uploaded"][0]
+        assert "File too large" in result["error"]
+
     @pytest.mark.parametrize("filename", ALL_SUPPORTED_UPLOAD_FILENAMES)
     def test_chat_upload_accepts_all_supported_file_types(
         self,
@@ -1102,6 +1138,34 @@ class TestMove:
             json={"src": "../../etc/passwd", "dst": "outputs/passwd"},
         )
         assert r.status_code == 400
+
+    def test_move_directory_into_itself_is_rejected_without_side_effects(self, workspace_client):
+        """Used to 500 after mkdir had already created child/ in the source (FL-BUG-008)."""
+        ws = _ws(workspace_client)
+        src = ws / "outputs" / "case"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep")
+        before = sorted(str(p.relative_to(src)) for p in src.rglob("*"))
+
+        r = _client(workspace_client).post(
+            "/api/workspace/move",
+            json={"src": "outputs/case", "dst": "outputs/case/child/moved"},
+        )
+
+        assert r.status_code == 400
+        assert "into itself" in r.json()["detail"]
+        assert sorted(str(p.relative_to(src)) for p in src.rglob("*")) == before
+
+    def test_move_directory_to_sibling_with_shared_prefix(self, workspace_client):
+        ws = _ws(workspace_client)
+        (ws / "outputs" / "case").mkdir()
+        (ws / "outputs" / "case" / "f.txt").write_text("x")
+        r = _client(workspace_client).post(
+            "/api/workspace/move",
+            json={"src": "outputs/case", "dst": "outputs/case-archive/case"},
+        )
+        assert r.status_code == 200
+        assert (ws / "outputs" / "case-archive" / "case" / "f.txt").read_text() == "x"
 
 
 # ─── Reveal in file manager ──────────────────────────────────────────────────

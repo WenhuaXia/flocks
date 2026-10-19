@@ -337,11 +337,11 @@ class TestCuratedCatalogModels:
             "minimax-m2.5",
             "GLM-5",
             "qwen3.6-plus",
-            "qwen3-max",
             "kimi-k2.6",
             "deepseek-v4-flash",
             "deepseek-v4-flash-0731",
             "deepseek-v4.1-flash",
+            "deepseek-v4.1-flash-1017",
         }
 
         assert models[0].id == "deepseek-v4.1-flash"
@@ -410,10 +410,10 @@ class TestCuratedCatalogModels:
             "minimax-m2.5",
             "GLM-5",
             "qwen3.6-plus",
-            "qwen3-max",
             "deepseek-v4-flash",
             "deepseek-v4-flash-0731",
             "deepseek-v4.1-flash",
+            "deepseek-v4.1-flash-1017",
         }
 
         assert models[0].id == "deepseek-v4.1-flash"

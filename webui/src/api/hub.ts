@@ -32,6 +32,8 @@ export interface HubCatalogEntry {
   installPath?: string;
   native: boolean;
   brokenReason?: string;
+  /** Installed through a Rex conversation instead of copying files (``rea``: the REA plugin). */
+  guidedInstall?: { kind: string; title?: string } | null;
 }
 
 export interface HubManifest extends HubCatalogEntry {
@@ -157,6 +159,13 @@ export interface HubSceneSuite {
   workspaceLatestVersion?: string | null;
 }
 
+export interface HubUpdatePlanPage {
+  id: string;
+  title: string;
+  /** Page directory inside the installed package. */
+  path: string;
+}
+
 export interface HubUpdatePlan {
   type: HubPluginType;
   id: string;
@@ -168,6 +177,10 @@ export interface HubUpdatePlan {
     id: string;
     name: string;
     requiresConfirmation: boolean;
+    /** WebUI packages: pages admins added, carried into the new release. */
+    keepPages?: HubUpdatePlanPage[];
+    /** WebUI packages: added pages the release replaces (same page id, or a folder the release uses). */
+    replacePages?: HubUpdatePlanPage[];
   }>;
 }
 

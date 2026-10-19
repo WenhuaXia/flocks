@@ -172,6 +172,11 @@ class AgentConfig(BaseModel):
     delegatable: Optional[bool] = Field(None, description="Whether this agent can be called via delegate_task")
     strategy: Optional[Literal["react", "plan_and_execute", "read_only", "explore"]] = None
     tools: Optional[Dict[str, bool]] = Field(None, description="@deprecated Use 'permission'")
+    skills: Optional[List[str]] = Field(None, description="Trusted skills loaded for this agent")
+    prompt_profile: Optional[Literal["standard", "isolated"]] = Field(
+        None,
+        alias="promptProfile",
+    )
 
     @field_validator("permission", mode="before")
     @classmethod
@@ -229,6 +234,21 @@ class ProviderOptionsConfig(BaseModel):
     enterprise_url: Optional[str] = Field(None, alias="enterpriseUrl")
     set_cache_key: Optional[bool] = Field(None, alias="setCacheKey")
     timeout: Optional[Union[int, Literal[False]]] = None
+    max_concurrent_requests: Optional[int] = Field(
+        None,
+        alias="maxConcurrentRequests",
+        ge=0,
+        description=(
+            "Cap on concurrent model requests to this provider across the "
+            "whole process (sessions, subagents, tasks and workflow llm nodes "
+            "share it). A response that only fans out to subagents stays "
+            "inside it; once it runs an inline tool it gives its slot up for "
+            "the rest of that response, so generating requests can exceed the "
+            "cap until that stream ends. Title, compaction, goal and memory "
+            "calls bypass it entirely. 0 disables the cap. Overrides "
+            "concurrency.maxConcurrentRequests."
+        ),
+    )
 
 
 class ModelVariantConfig(BaseModel):
@@ -411,6 +431,48 @@ class ToolFailureConfig(BaseModel):
     )
 
 
+class DataRetentionConfig(BaseModel):
+    """How long logs, messages and sessions are kept (days; 0 keeps them forever).
+
+    A key left out of flocks.json falls back to the built-in default: logs use
+    FLOCKS_LOG_RETENTION_DAYS (30 days unset), messages and sessions are kept.
+    """
+
+    # A hand-edited bad value must not break loading the whole config: values
+    # that are not whole numbers read as "not set", and flocks.retention.policy
+    # treats negative numbers the same way.
+    model_config = {"populate_by_name": True}
+
+    log_days: Optional[int] = Field(None, alias="logDays")
+    message_days: Optional[int] = Field(None, alias="messageDays")
+    session_days: Optional[int] = Field(None, alias="sessionDays")
+
+    @field_validator("log_days", "message_days", "session_days", mode="before")
+    @classmethod
+    def _ignore_unreadable_days(cls, value: Any) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value) if value.is_integer() else None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            sign = ""
+            if text[0] in "+-":
+                sign, text = text[0], text[1:]
+            # Non-empty ASCII digits only: ``str.isdigit`` also accepts
+            # superscripts etc., and "" / "+" / "-" must not reach ``int``.
+            if text and text.isascii() and text.isdigit():
+                try:
+                    return int(f"{sign}{text}")
+                except ValueError:
+                    return None
+        return None
+
+
 class EnterpriseConfig(BaseModel):
     """Enterprise configuration"""
 
@@ -467,6 +529,39 @@ class UIConfig(BaseModel):
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in normalized):
             raise ValueError("faviconPath must not contain control characters")
         return normalized
+
+
+class ConcurrencyConfig(BaseModel):
+    """Process-wide limits on model requests and subagent fan-out."""
+    model_config = {"extra": "allow", "populate_by_name": True}
+
+    max_concurrent_requests: Optional[int] = Field(
+        None,
+        alias="maxConcurrentRequests",
+        ge=0,
+        description=(
+            "Default cap on generating model requests per provider. Every caller "
+            "in the process (interactive sessions, foreground subagents, "
+            "scheduled/background tasks, workflow llm nodes) shares it; requests "
+            "beyond the cap queue in-process instead of hitting the provider's "
+            "own limit and failing with HTTP 429. A response that only fans out "
+            "to subagents stays inside the cap; once it runs an inline tool it "
+            "gives its slot up for the rest of that response, so generating "
+            "requests can exceed the cap until the stream ends. Title, "
+            "compaction, goal and memory calls bypass it entirely. 0 disables "
+            "the cap. Falls back to FLOCKS_LLM_MAX_CONCURRENT_REQUESTS, then 8."
+        ),
+    )
+    max_parallel_subagents: Optional[int] = Field(
+        None,
+        alias="maxParallelSubagents",
+        ge=0,
+        description=(
+            "How many sibling delegate_task calls from one model response run at "
+            "the same time; the rest start as earlier ones finish. 0 disables "
+            "the cap. Falls back to FLOCKS_SUBAGENT_MAX_PARALLEL, then 4."
+        ),
+    )
 
 
 class ExperimentalConfig(BaseModel):
@@ -800,6 +895,8 @@ class ConfigInfo(BaseModel):
     disabled_providers: Optional[List[str]] = None
     enabled_providers: Optional[List[str]] = None
     model: Optional[str] = None
+    default_models: Optional[Dict[str, Any]] = None
+    api_services: Optional[Dict[str, Any]] = None
     small_model: Optional[str] = Field(None, alias="smallModel")
     fallback_providers: Optional[List[FallbackProviderConfig]] = None
     default_agent: Optional[str] = Field(None, alias="defaultAgent")
@@ -842,8 +939,57 @@ class ConfigInfo(BaseModel):
         alias="toolFailure",
         description="Repeated tool-failure handling.",
     )
+    data_retention: Optional[DataRetentionConfig] = Field(
+        None,
+        alias="dataRetention",
+        description="Retention days for logs, messages and sessions (0 keeps forever).",
+    )
+
+    @field_validator("data_retention", mode="before")
+    @classmethod
+    def _ignore_non_mapping_data_retention(cls, value: Any) -> Any:
+        # A hand-edited ``dataRetention: "soon"`` or ``[]`` must not break loading
+        # the whole config; drop it and fall back to the defaults.
+        if value is None or isinstance(value, (dict, DataRetentionConfig)):
+            return value
+        return None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _single_data_retention_spelling(cls, data: Any) -> Any:
+        """Collapse ``dataRetention`` / ``data_retention`` into the one canonical key.
+
+        Both spellings fill the same field. Left alone, a payload carrying both
+        keeps one as the field and the other as an *extra*; the config merge
+        (validate -> dump -> re-validate) can then turn that extra back into the
+        field, so a single validation and the value actually written disagree,
+        and the extra is written to disk and echoed by GET. Choosing one value
+        here, deterministically, makes every path agree: a real mapping under the
+        camelCase key wins; a null or non-mapping camelCase value means "not set
+        here" and yields to the snake_case one.
+        """
+        if not isinstance(data, dict) or "dataRetention" not in data or "data_retention" not in data:
+            return data
+        normalized = dict(data)
+        snake = normalized.pop("data_retention")
+        if not isinstance(normalized.get("dataRetention"), (dict, DataRetentionConfig)):
+            normalized["dataRetention"] = snake
+        return normalized
+
     experimental: Optional[ExperimentalConfig] = None
-    
+    concurrency: Optional[ConcurrencyConfig] = Field(
+        None,
+        description="Process-wide model request / subagent concurrency limits.",
+    )
+    # Workflow engine settings, read raw by flocks.workflow.runner
+    workflow: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Workflow engine settings. Keys: llm.max_concurrency (concurrent LLM "
+            "calls on the workflow loop; default 8, 0 = unlimited)."
+        ),
+    )
+
     # Memory system configuration (added for memory system integration)
     memory: Optional[Any] = Field(
         None,
@@ -1517,6 +1663,12 @@ class Config:
         Returns:
             Complete merged configuration
         """
+        from flocks.config.runtime import runtime_config
+
+        override = runtime_config.get()
+        if override is not None:
+            return override
+
         if cls._cached_config is not None:
             return cls._cached_config
         
@@ -1657,6 +1809,9 @@ class Config:
                     channel_cfg = channels.get(channel_id)
                     if isinstance(channel_cfg, dict):
                         channel_cfg.pop("allowFrom", None)
+        from flocks.config.runtime import runtime_config
+        if runtime_config.get() is not None:
+            raise RuntimeError("Configuration writes are disabled during a runtime override")
         config_file.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
         
         # Clear cache

@@ -19,7 +19,7 @@ from flocks.hub.catalog import (
     load_taxonomy,
 )
 from flocks.hub.files import file_tree, read_file_content
-from flocks.license import license_status
+from flocks.license import is_pro_edition_status, license_status
 from flocks.hub.installer import install_plugin, uninstall_plugin, update_plugin
 from flocks.hub.update_protection import UpdateConfirmationRequired, build_plan, public_plan
 from flocks.hub.models import (
@@ -312,7 +312,8 @@ async def _publish_scene_suites_changed(plugin_type: PluginType, plugin_id: str,
         suite_ids = [plugin_id] if plugin_type == "component" else []
         if plugin_type != "component":
             # Updating a child also changes its suite's update/completeness
-            # state. Refresh other open scene views without a manual reload.
+            # state. Refresh the acting user's other open scene views
+            # without a manual reload.
             entries = await asyncio.to_thread(list_catalog, plugin_type="component")
             for entry in entries:
                 refs = load_manifest("component", entry.id).components
@@ -324,6 +325,24 @@ async def _publish_scene_suites_changed(plugin_type: PluginType, plugin_id: str,
         # Notification failures must not hide the installer result or prevent
         # streaming responses from closing after a failed installation.
         log.warning("hub.scene_suites.notify_failed", {"id": plugin_id, "action": action, "error": str(exc)})
+
+
+def _guard_guided_install(plugin_type: PluginType, plugin_id: str) -> None:
+    """Plugins installed through a Rex conversation have no file-copy install, update or uninstall."""
+
+    try:
+        manifest = load_manifest(plugin_type, plugin_id)
+    except Exception:
+        return
+    if getattr(manifest, "guidedInstall", None) is None:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "hub_guided_install",
+            "message": "该插件通过 Rex 会话安装：在插件广场点击安装后，由 Rex 在新会话中完成安装与验证。",
+        },
+    )
 
 
 async def _assert_edition_allowed(plugin_type: PluginType, plugin_id: str) -> None:
@@ -338,8 +357,7 @@ async def _assert_edition_allowed(plugin_type: PluginType, plugin_id: str) -> No
         status_payload = await license_status()
     except Exception:
         status_payload = {}
-    edition = str(status_payload.get("status") or "").lower()
-    if edition == "oss" or not status_payload.get("active"):
+    if not is_pro_edition_status(status_payload):
         raise HTTPException(
             status_code=403,
             detail="该套件需要 Flocks Pro 授权后才能安装，请先在系统设置中升级。",
@@ -354,6 +372,7 @@ async def hub_install_plugin(
     _admin: object = Depends(require_admin),
 ):
     _guard_legacy_removed_plugin(plugin_type, plugin_id)
+    _guard_guided_install(plugin_type, plugin_id)
     await _assert_edition_allowed(plugin_type, plugin_id)
     try:
         return await install_plugin(plugin_type, plugin_id, scope=req.scope)
@@ -374,6 +393,7 @@ async def hub_install_plugin_stream(
     _admin: object = Depends(require_admin),
 ):
     _guard_legacy_removed_plugin(plugin_type, plugin_id)
+    _guard_guided_install(plugin_type, plugin_id)
     await _assert_edition_allowed(plugin_type, plugin_id)
     if plugin_type != "component":
         raise HTTPException(status_code=400, detail="Streaming install progress is only supported for components.")
@@ -429,6 +449,7 @@ async def hub_preview_update(
     _admin: object = Depends(require_admin),
 ):
     _guard_legacy_removed_plugin(plugin_type, plugin_id)
+    _guard_guided_install(plugin_type, plugin_id)
     await _assert_edition_allowed(plugin_type, plugin_id)
     try:
         return public_plan(await asyncio.to_thread(build_plan, plugin_type, plugin_id, req.scope))
@@ -444,6 +465,7 @@ async def hub_update_plugin(
     _admin: object = Depends(require_admin),
 ):
     _guard_legacy_removed_plugin(plugin_type, plugin_id)
+    _guard_guided_install(plugin_type, plugin_id)
     await _assert_edition_allowed(plugin_type, plugin_id)
     try:
         return await update_plugin(plugin_type, plugin_id, scope=req.scope,
@@ -464,6 +486,7 @@ async def hub_uninstall_plugin(
     _admin: object = Depends(require_admin),
 ):
     _guard_legacy_removed_plugin(plugin_type, plugin_id)
+    _guard_guided_install(plugin_type, plugin_id)
     try:
         removed = await uninstall_plugin(plugin_type, plugin_id)
         return {"removed": removed}
